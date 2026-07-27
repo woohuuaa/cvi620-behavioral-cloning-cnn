@@ -1,0 +1,51 @@
+# Python cache and test artifacts
+__pycache__/
+*.py[cod]
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local virtual environments and build output
+.venv/
+venv/
+env/
+ENV/
+*.egg-info/
+build/
+dist/
+
+# Simulator dataset and application
+IMG/
+driving_log.csv
+simulator-windows-64/
+
+# Trained models and generated training output
+*.h5
+*.keras
+*.ckpt
+checkpoint
+training_outputs/
+logs/
+
+# Temporary files
+tmp/
+*.tmp
+*.log
+
+# Local editor and Codex files
+.agents/
+.codex/
+.vscode/
+.idea/
+
+# Operating system files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Instructor-provided or superseded local files
+Final_Project.pdf
+package_list (2).txt
