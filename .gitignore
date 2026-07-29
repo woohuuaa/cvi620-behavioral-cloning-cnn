@@ -21,6 +21,7 @@ dist/
 IMG/
 driving_log.csv
 simulator-windows-64/
+simulator-mac/
 
 # Trained models and generated training output
 *.h5
