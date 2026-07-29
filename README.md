@@ -16,6 +16,7 @@ end-to-end CNN architecture required by the CVI620 final project specification.
 - Memory-efficient Keras batch generator
 - NVIDIA CNN with validation, checkpointing, learning-rate reduction, and early stopping
 - Native Windows GPU training with TensorFlow 2.10
+- macOS training via TensorFlow-Metal (Apple Silicon)
 - Socket.IO integration with the simulator's autonomous mode
 
 ## Project Structure
@@ -25,11 +26,13 @@ end-to-end CNN architecture required by the CVI620 final project specification.
 |-- training.py
 |-- TestSimulation.py
 |-- environment-windows-gpu.yml
+|-- environment-mac.yml
 |-- README.md
 |-- driving_log.csv               # Local dataset, not committed
 |-- IMG/                          # Local camera images, not committed
 |-- model.h5                      # Generated trained model, not committed
 |-- simulator-windows-64/         # Local simulator, not committed
+|-- simulator-mac/                # Local simulator, not committed
 `-- training_outputs/             # Generated plots and logs
 ```
 
@@ -52,6 +55,38 @@ conda activate CVIS26_Final
 Verify that TensorFlow detects the GPU:
 
 ```powershell
+python -c "import tensorflow as tf; print(tf.config.list_physical_devices('GPU'))"
+```
+
+## macOS Environment (Apple Silicon)
+
+The provided Conda environment mirrors the Windows environment, swapping the
+CUDA/cuDNN GPU stack for Apple's Metal backend:
+
+- Python 3.9
+- TensorFlow 2.10.0 (`tensorflow-macos` + `tensorflow-metal`)
+- All other pinned package versions match `environment-windows-gpu.yml`, except
+  `numpy` (1.23.5 instead of 1.22.4 — required by the `tensorflow-macos` 2.10.0
+  wheel's compiled NumPy ABI)
+
+Install [Miniforge](https://github.com/conda-forge/miniforge) if you don't
+already have Conda:
+
+```bash
+brew install --cask miniforge
+conda init zsh
+```
+
+Create and activate the environment:
+
+```bash
+conda env create -f environment-mac.yml
+conda activate CVIS26_Final
+```
+
+Verify that TensorFlow detects the GPU:
+
+```bash
 python -c "import tensorflow as tf; print(tf.config.list_physical_devices('GPU'))"
 ```
 
@@ -169,6 +204,27 @@ Keep that terminal open. In a second terminal, launch the simulator:
 
 Select `AUTONOMOUS MODE`. The simulator connects automatically to the
 Socket.IO server on `localhost:4567`.
+
+On macOS, run the equivalent commands:
+
+```bash
+conda activate CVIS26_Final
+cd /path/to/behavioral-cloning-steering-cnn
+python TestSimulation.py
+```
+
+Keep that terminal open. In a second terminal, launch the simulator app:
+
+```bash
+open "simulator-mac/Default Mac desktop Universal.app"
+```
+
+The simulator app is unsigned, so the first launch requires clearing macOS's
+quarantine flag (one-time):
+
+```bash
+xattr -dr com.apple.quarantine "simulator-mac/Default Mac desktop Universal.app"
+```
 
 Successful communication prints:
 
