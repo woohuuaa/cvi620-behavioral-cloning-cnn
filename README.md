@@ -106,7 +106,7 @@ The CSV columns are:
 center, left, right, steering, throttle, brake, speed
 ```
 
-Only the center-camera path and steering value are used by this project.
+The center-camera path, steering value, and speed are used by this project.
 
 ## Preprocessing
 
@@ -121,19 +121,27 @@ Training preprocessing intentionally matches `TestSimulation.py`:
 ## Model Architecture
 
 ```text
-Input: 66x200x3
-Conv2D: 24 filters, 5x5, stride 2
-Conv2D: 36 filters, 5x5, stride 2
-Conv2D: 48 filters, 5x5, stride 2
-Conv2D: 64 filters, 3x3
-Conv2D: 64 filters, 3x3
-Flatten
+Input: 66x200x3                    Input: speed (1, normalized by MAX_SPEED=30)
+Conv2D: 24 filters, 5x5, stride 2              |
+Conv2D: 36 filters, 5x5, stride 2              |
+Conv2D: 48 filters, 5x5, stride 2              |
+Conv2D: 64 filters, 3x3                        |
+Conv2D: 64 filters, 3x3                        |
+Flatten ------------------------- Concatenate--/
 Dense: 1164
 Dense: 100
 Dense: 50
 Dense: 10
 Output: 1 steering value
 ```
+
+This extends the required NVIDIA end-to-end CNN (PDF Figure 7) with a second
+input: the vehicle's current speed, concatenated onto the flattened image
+features. The convolutional stack itself is unchanged. This lets the model
+apply a different steering angle for the same visual curve depending on
+speed, since the same steering angle produces a different turn radius at
+different speeds. `TestSimulation.py` must normalize speed by the same
+`MAX_SPEED` divisor used in `training.py`.
 
 The model uses ELU activations, Adam, mean squared error loss, and mean
 absolute error as an additional metric.
