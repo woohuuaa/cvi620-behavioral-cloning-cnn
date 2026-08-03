@@ -45,11 +45,6 @@ ROTATION_STEERING_FACTOR = 0.01
 # when it builds the speed input at inference time.
 MAX_SPEED = 30.0
 
-# Steering offset applied to left/right camera images so they can be trained
-# as synthetic recovery examples (a left-camera shot looks like the car is
-# already right of center, so the "correct" steering is more toward the left).
-STEERING_CORRECTION = 0.2
-
 # Number of consecutive rows kept together on one side of the train/validation
 # split. Splitting individual frames would let near-duplicate consecutive
 # frames (captured ~every 100ms) leak across the split, making validation
@@ -159,11 +154,10 @@ def load_driving_rows(
     csv_path=DRIVING_LOG_PATH,
     image_dir=IMAGE_DIR,
 ):
-    """Load center/left/right paths, steering, and speed from driving_log.csv.
+    """Load center-camera path, steering, and speed from driving_log.csv.
 
     Returns one entry per recorded instant, in original CSV row order, so
-    callers can split train/validation by contiguous chunks before expanding
-    each row into per-camera training samples.
+    callers can split train/validation by contiguous chunks.
     """
     rows = []
 
@@ -175,14 +169,11 @@ def load_driving_rows(
                     f"Row {row_number} has {len(row)} columns; expected at least 7"
                 )
 
-            camera_paths = []
-            for column_index, camera_name in ((0, "Center"), (1, "Left"), (2, "Right")):
-                camera_path = image_dir / Path(row[column_index].strip()).name
-                if not camera_path.is_file():
-                    raise FileNotFoundError(
-                        f"{camera_name} image from row {row_number} was not found: {camera_path}"
-                    )
-                camera_paths.append(camera_path)
+            center_path = image_dir / Path(row[0].strip()).name
+            if not center_path.is_file():
+                raise FileNotFoundError(
+                    f"Center image from row {row_number} was not found: {center_path}"
+                )
 
             try:
                 steering = float(row[3].strip())
@@ -198,33 +189,12 @@ def load_driving_rows(
                     f"Invalid speed value on row {row_number}: {row[6]!r}"
                 ) from error
 
-            center_path, left_path, right_path = camera_paths
-            rows.append((center_path, left_path, right_path, steering, speed))
+            rows.append((center_path, steering, speed))
 
     if not rows:
         raise ValueError(f"No driving rows found in {csv_path}")
 
     return rows
-
-
-def expand_camera_samples(rows, use_side_cameras, correction=STEERING_CORRECTION):
-    """Flatten center/left/right rows into (path, steering, speed) samples.
-
-    When use_side_cameras is enabled, the left/right images are included as
-    synthetic recovery examples: a left-camera shot looks like the car has
-    already drifted right of center, so it's labeled with more left steering
-    (and symmetrically for the right camera).
-    """
-    samples = []
-    for center_path, left_path, right_path, steering, speed in rows:
-        samples.append((center_path, steering, speed))
-        if use_side_cameras:
-            left_steering = float(np.clip(steering + correction, -1.0, 1.0))
-            right_steering = float(np.clip(steering - correction, -1.0, 1.0))
-            samples.append((left_path, left_steering, speed))
-            samples.append((right_path, right_steering, speed))
-
-    return samples
 
 
 def split_rows_by_chunk(rows, validation_split, chunk_size, seed):
@@ -489,14 +459,6 @@ def parse_args():
             "set of training_outputs files, leaving model.h5 untouched."
         ),
     )
-    parser.add_argument(
-        "--no-side-cameras",
-        action="store_true",
-        help=(
-            "Only train on the center camera; disables the left/right camera "
-            "steering-correction augmentation."
-        ),
-    )
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
 
@@ -517,7 +479,6 @@ def main():
     tf.random.set_seed(args.seed)
 
     use_speed = not args.no_speed
-    use_side_cameras = not args.no_side_cameras
     model_path = MODEL_PATH if use_speed else PROJECT_DIR / "model_no_speed.h5"
     suffix = "" if use_speed else "_no_speed"
 
@@ -531,11 +492,8 @@ def main():
         seed=args.seed,
     )
 
-    # Left/right camera augmentation only applies to training; validation
-    # stays center-camera only so it reflects what the model actually sees
-    # when driving (TestSimulation.py only ever sends the center camera).
-    train_samples_before_balancing = expand_camera_samples(train_rows, use_side_cameras)
-    validation_samples = expand_camera_samples(validation_rows, use_side_cameras=False)
+    train_samples_before_balancing = train_rows
+    validation_samples = validation_rows
 
     # Balance the training samples
     train_samples = balance_training_samples(
@@ -578,14 +536,13 @@ def main():
     first_inputs, first_steering = training_sequence[0]
     print(f"Loaded rows: {len(rows)} (train rows: {len(train_rows)}, validation rows: {len(validation_rows)})")
     print(
-        "Training camera samples before balancing: "
+        "Training samples before balancing: "
         f"{len(train_samples_before_balancing)}"
     )
     print(f"Training samples after balancing: {len(train_samples)}")
-    print(f"Validation samples (center camera only): {len(validation_samples)}")
+    print(f"Validation samples: {len(validation_samples)}")
     print(f"Training augmentation: {not args.no_augmentation}")
     print(f"Using speed input: {use_speed}")
-    print(f"Using left/right camera augmentation: {use_side_cameras}")
     print(f"Saved steering histogram: {histogram_path}")
     if use_speed:
         print(
