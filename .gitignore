@@ -18,8 +18,8 @@ build/
 dist/
 
 # Simulator dataset and application
-IMG/
-driving_log.csv
+IMG*/
+driving_log*.csv
 simulator-windows-64/
 simulator-mac/
 
@@ -28,7 +28,7 @@ simulator-mac/
 *.keras
 *.ckpt
 checkpoint
-training_outputs/
+training_outputs*/
 logs/
 
 # Temporary files
