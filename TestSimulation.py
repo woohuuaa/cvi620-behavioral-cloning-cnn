@@ -14,6 +14,7 @@ import cv2
 sio = socketio.Server()
 app = Flask(__name__) #__main__
 maxSpeed = 10
+MAX_SPEED = 30.0  # Must match the value used by training.py
 
 def preProcessing(img):
     img = img[60:135, :, :]
@@ -32,7 +33,10 @@ def telemetry(sid, data):
     image = np.asarray(image)
     image = preProcessing(image)
     image = np.array([image])
-    steering = float(model.predict(image))
+    speed_input = np.array([[speed / MAX_SPEED]], dtype=np.float32)
+    steering = float(model.predict(
+        {"preprocessed_image": image, "speed": speed_input}, verbose=0
+    )[0][0])
     throttle = 1.0 - speed/maxSpeed
     print(f'{throttle}, {steering}, {speed}')
     sendControl(steering, throttle)
