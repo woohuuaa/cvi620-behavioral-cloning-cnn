@@ -22,9 +22,10 @@ IMG/
 driving_log.csv
 simulator-windows-64/
 simulator-mac/
+virtual_joystick.py
 
 # Trained models and generated training output
-*.h5
+# *.h5
 *.keras
 *.ckpt
 checkpoint
@@ -41,6 +42,7 @@ tmp/
 .codex/
 .vscode/
 .idea/
+.claude/
 
 # Operating system files
 .DS_Store
