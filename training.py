@@ -1,4 +1,4 @@
-"""Train the steering-angle CNN required by Final_Project.pdf.
+"""Train the steering-angle CNN for the driving simulator.
 
 Run:
     python training.py --epochs 20 --batch-size 64
@@ -14,14 +14,13 @@ import matplotlib
 import numpy as np
 import tensorflow as tf
 from sklearn.model_selection import train_test_split
+from tensorflow.keras import layers, Sequential
 from tensorflow.keras.callbacks import (
     CSVLogger,
     EarlyStopping,
     ModelCheckpoint,
     ReduceLROnPlateau,
 )
-from tensorflow.keras.layers import Concatenate, Conv2D, Dense, Flatten, Input
-from tensorflow.keras.models import Model, Sequential
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.utils import Sequence
 
@@ -29,26 +28,17 @@ matplotlib.use("Agg")
 from matplotlib import pyplot as plt
 
 
+# DATA
 PROJECT_DIR = Path(__file__).resolve().parent
 DRIVING_LOG_PATH = PROJECT_DIR / "driving_log.csv"
 IMAGE_DIR = PROJECT_DIR / "IMG"
 MODEL_PATH = PROJECT_DIR / "model.h5"
 OUTPUT_DIR = PROJECT_DIR / "training_outputs"
 
-PAN_RANGE_X = 40.0
-PAN_RANGE_Y = 8.0
-PAN_STEERING_FACTOR = 0.002
-ROTATION_RANGE_DEGREES = 5.0
-ROTATION_STEERING_FACTOR = 0.01
-
-# Speed normalization divisor. Must match the value used by TestSimulation.py
-# when it builds the speed input at inference time.
-MAX_SPEED = 30.0
-
-# Steering offset applied to left/right camera images so they can be trained
-# as synthetic recovery examples (a left-camera shot looks like the car is
-# already right of center, so the "correct" steering is more toward the left).
-STEERING_CORRECTION = 0.2
+# AUGMENTATION SETTINGS
+AUGMENTATION_PROBABILITY = 0.30
+BRIGHTNESS_RANGE = (0.8, 1.2)
+ZOOM_RANGE = (1.0, 1.08)
 
 # Number of consecutive rows kept together on one side of the train/validation
 # split. Splitting individual frames would let near-duplicate consecutive
@@ -90,22 +80,27 @@ def _warp_image(image, matrix):
 
 
 def augment_image(image, steering, rng):
-    """Randomly apply pan, zoom, rotation, brightness, and horizontal flip."""
+    """Apply one mild augmentation without changing the steering label."""
     height, width = image.shape[:2]
     augmented = image.copy()
     steering = float(steering)
 
-    # Pan the image and adjust the steering angle accordingly
-    if rng.random() < 0.5:
-        shift_x = float(rng.uniform(-PAN_RANGE_X, PAN_RANGE_X))
-        shift_y = float(rng.uniform(-PAN_RANGE_Y, PAN_RANGE_Y))
-        pan_matrix = np.float32([[1, 0, shift_x], [0, 1, shift_y]])
-        augmented = _warp_image(augmented, pan_matrix)
-        steering += shift_x * PAN_STEERING_FACTOR
+    # Keep most samples unchanged so the model primarily learns the real track.
+    if rng.random() >= AUGMENTATION_PROBABILITY:
+        return np.ascontiguousarray(augmented), steering
 
-    # Zoom the image and adjust the steering angle accordingly
+    # Apply exactly one mild transformation instead of stacking several of them.
     if rng.random() < 0.5:
-        zoom = float(rng.uniform(1.0, 1.2))
+        brightness = float(rng.uniform(*BRIGHTNESS_RANGE))
+        hsv = cv2.cvtColor(augmented, cv2.COLOR_RGB2HSV)
+        hsv[:, :, 2] = np.clip(
+            hsv[:, :, 2].astype(np.float32) * brightness,
+            0,
+            255,
+        ).astype(np.uint8)
+        augmented = cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB)
+    else:
+        zoom = float(rng.uniform(*ZOOM_RANGE))
         zoom_matrix = cv2.getRotationMatrix2D(
             (width / 2.0, height / 2.0),
             0.0,
@@ -113,45 +108,6 @@ def augment_image(image, steering, rng):
         )
         augmented = _warp_image(augmented, zoom_matrix)
 
-    # Rotate the image and adjust the steering angle accordingly
-    if rng.random() < 0.5:
-        # Randomly choose a rotation angle between -5 and 5
-        angle = float(rng.uniform(-ROTATION_RANGE_DEGREES, ROTATION_RANGE_DEGREES))
-
-        # Create a rotation matrix around the center of the image
-        rotation_matrix = cv2.getRotationMatrix2D((width / 2.0, height / 2.0), angle, 1.0,)
-        augmented = _warp_image(augmented, rotation_matrix)
-
-        # Adjust the steering angle based on the rotation angle
-        steering -= angle * ROTATION_STEERING_FACTOR
-
-    # Adjust the brightness of the image in HSV color space
-    if rng.random() < 0.5:
-        # Randomly choose a brightness factor between 0.6 and 1.2
-
-        brightness = float(rng.uniform(0.6, 1.2))
-
-        # Convert the image to HSV color space
-        hsv = cv2.cvtColor(augmented, cv2.COLOR_RGB2HSV)
-
-        # Scale the V channel by the brightness factor and clip to [0, 255]
-        hsv[:, :, 2] = np.clip(
-            hsv[:, :, 2].astype(np.float32) * brightness, 0, 255,).astype(np.uint8)
-
-        # Convert back to RGB color space
-        augmented = cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB)
-
-    # Randomly flip the image horizontally and invert the steering angle
-    if rng.random() < 0.5:
-        # Flip the image horizontally
-        augmented = cv2.flip(augmented, 1)
-        # Invert the steering angle
-        steering *= -1.0
-
-    # Clip the steering angle to the range [-1.0, 1.0] to avoid extreme values
-    steering = float(np.clip(steering, -1.0, 1.0))
-
-    # Return the augmented image and the adjusted steering angle as contiguous arrays
     return np.ascontiguousarray(augmented), steering
 
 
@@ -159,30 +115,26 @@ def load_driving_rows(
     csv_path=DRIVING_LOG_PATH,
     image_dir=IMAGE_DIR,
 ):
-    """Load center/left/right paths, steering, and speed from driving_log.csv.
+    """Load center-camera paths and steering values from driving_log.csv.
 
     Returns one entry per recorded instant, in original CSV row order, so
-    callers can split train/validation by contiguous chunks before expanding
-    each row into per-camera training samples.
+    callers can split train/validation by contiguous chunks.
     """
     rows = []
 
     with csv_path.open(newline="", encoding="utf-8-sig") as stream:
         reader = csv.reader(stream)
         for row_number, row in enumerate(reader, start=1):
-            if len(row) < 7:
+            if len(row) < 4:
                 raise ValueError(
-                    f"Row {row_number} has {len(row)} columns; expected at least 7"
+                    f"Row {row_number} has {len(row)} columns; expected at least 4"
                 )
 
-            camera_paths = []
-            for column_index, camera_name in ((0, "Center"), (1, "Left"), (2, "Right")):
-                camera_path = image_dir / Path(row[column_index].strip()).name
-                if not camera_path.is_file():
-                    raise FileNotFoundError(
-                        f"{camera_name} image from row {row_number} was not found: {camera_path}"
-                    )
-                camera_paths.append(camera_path)
+            center_path = image_dir / Path(row[0].strip()).name
+            if not center_path.is_file():
+                raise FileNotFoundError(
+                    f"Center image from row {row_number} was not found: {center_path}"
+                )
 
             try:
                 steering = float(row[3].strip())
@@ -191,40 +143,12 @@ def load_driving_rows(
                     f"Invalid steering value on row {row_number}: {row[3]!r}"
                 ) from error
 
-            try:
-                speed = float(row[6].strip())
-            except ValueError as error:
-                raise ValueError(
-                    f"Invalid speed value on row {row_number}: {row[6]!r}"
-                ) from error
-
-            center_path, left_path, right_path = camera_paths
-            rows.append((center_path, left_path, right_path, steering, speed))
+            rows.append((center_path, steering))
 
     if not rows:
         raise ValueError(f"No driving rows found in {csv_path}")
 
     return rows
-
-
-def expand_camera_samples(rows, use_side_cameras, correction=STEERING_CORRECTION):
-    """Flatten center/left/right rows into (path, steering, speed) samples.
-
-    When use_side_cameras is enabled, the left/right images are included as
-    synthetic recovery examples: a left-camera shot looks like the car has
-    already drifted right of center, so it's labeled with more left steering
-    (and symmetrically for the right camera).
-    """
-    samples = []
-    for center_path, left_path, right_path, steering, speed in rows:
-        samples.append((center_path, steering, speed))
-        if use_side_cameras:
-            left_steering = float(np.clip(steering + correction, -1.0, 1.0))
-            right_steering = float(np.clip(steering - correction, -1.0, 1.0))
-            samples.append((left_path, left_steering, speed))
-            samples.append((right_path, right_steering, speed))
-
-    return samples
 
 
 def split_rows_by_chunk(rows, validation_split, chunk_size, seed):
@@ -322,13 +246,12 @@ def plot_steering_histogram(before_balancing, after_balancing, bins, filename="s
 class DrivingSequence(Sequence):
     """Load, augment, and preprocess simulator images one batch at a time."""
 
-    def __init__(self, samples, batch_size, augment, shuffle, seed, use_speed=True):
+    def __init__(self, samples, batch_size, augment, shuffle, seed):
         """Store batch settings and initialize the sample index order."""
         self.samples = samples
         self.batch_size = batch_size
         self.augment = augment
         self.shuffle = shuffle
-        self.use_speed = use_speed
         self.rng = np.random.default_rng(seed)
         self.indices = np.arange(len(samples))
         self.on_epoch_end()
@@ -344,23 +267,19 @@ class DrivingSequence(Sequence):
         batch_indices = self.indices[start:stop]
 
         images = np.empty((len(batch_indices), 66, 200, 3), dtype=np.float32)
-        speeds = np.empty((len(batch_indices), 1), dtype=np.float32)
         steering_values = np.empty(len(batch_indices), dtype=np.float32)
 
         # Load, augment, and preprocess each sample in the batch
         for output_index, sample_index in enumerate(batch_indices):
-            image_path, steering, speed = self.samples[int(sample_index)]
+            image_path, steering = self.samples[int(sample_index)]
             image = load_rgb_image(image_path)
 
             if self.augment:
                 image, steering = augment_image(image, steering, self.rng)
 
             images[output_index] = preProcessing(image)
-            speeds[output_index] = speed / MAX_SPEED
             steering_values[output_index] = steering
 
-        if self.use_speed:
-            return {"preprocessed_image": images, "speed": speeds}, steering_values
         return images, steering_values
 
     def on_epoch_end(self):
@@ -369,56 +288,25 @@ class DrivingSequence(Sequence):
             self.rng.shuffle(self.indices)
 
 
-def build_nvidia_model_with_speed():
-    """Build and compile the NVIDIA CNN (PDF Figure 7), extended with a speed input.
-
-    The convolutional stack is unchanged from the required architecture. Current
-    vehicle speed is concatenated onto the flattened image features so the same
-    visual curve can map to a different steering angle depending on speed.
-    """
-    image_input = Input(shape=(66, 200, 3), name="preprocessed_image")
-    speed_input = Input(shape=(1,), name="speed")
-
-    x = Conv2D(24, (5, 5), strides=(2, 2), activation="elu", name="conv_1")(image_input)
-    x = Conv2D(36, (5, 5), strides=(2, 2), activation="elu", name="conv_2")(x)
-    x = Conv2D(48, (5, 5), strides=(2, 2), activation="elu", name="conv_3")(x)
-    x = Conv2D(64, (3, 3), activation="elu", name="conv_4")(x)
-    x = Conv2D(64, (3, 3), activation="elu", name="conv_5")(x)
-    x = Flatten(name="flatten")(x)
-    x = Concatenate(name="image_features_and_speed")([x, speed_input])
-    x = Dense(1164, activation="elu", name="dense_1164")(x)
-    x = Dense(100, activation="elu", name="dense_100")(x)
-    x = Dense(50, activation="elu", name="dense_50")(x)
-    x = Dense(10, activation="elu", name="dense_10")(x)
-    steering_output = Dense(1, name="steering")(x)
-
-    model = Model(
-        inputs=[image_input, speed_input],
-        outputs=steering_output,
-        name="nvidia_steering_model_speed_aware",
-    )
-    model.compile(optimizer=Adam(learning_rate=1e-4), loss="mse", metrics=["mae"])
-    return model
-
-
-def build_nvidia_model_image_only():
-    """Build and compile the original NVIDIA CNN (PDF Figure 7), image-only."""
+# MODEL
+def build_steering_model():
     model = Sequential([
-        Input(shape=(66, 200, 3), name="preprocessed_image"),
-        Conv2D(24, (5, 5), strides=(2, 2), activation="elu", name="conv_1"),
-        Conv2D(36, (5, 5), strides=(2, 2), activation="elu", name="conv_2"),
-        Conv2D(48, (5, 5), strides=(2, 2), activation="elu", name="conv_3"),
-        Conv2D(64, (3, 3), activation="elu", name="conv_4"),
-        Conv2D(64, (3, 3), activation="elu", name="conv_5"),
-        Flatten(name="flatten"),
-        Dense(1164, activation="elu", name="dense_1164"),
-        Dense(100, activation="elu", name="dense_100"),
-        Dense(50, activation="elu", name="dense_50"),
-        Dense(10, activation="elu", name="dense_10"),
-        Dense(1, name="steering"),
-    ], name="nvidia_steering_model")
+        layers.Input(shape=(66, 200, 3)),
+        layers.Conv2D(24, (5, 5), strides=(2, 2), activation="elu"),
+        layers.Conv2D(36, (5, 5), strides=(2, 2), activation="elu"),
+        layers.Conv2D(48, (5, 5), strides=(2, 2), activation="elu"),
+        layers.Conv2D(64, (3, 3), activation="elu"),
+        layers.Conv2D(64, (3, 3), activation="elu"),
+        layers.Flatten(),
+        layers.Dense(1164, activation="elu"),
+        layers.Dense(100, activation="elu"),
+        layers.Dense(50, activation="elu"),
+        layers.Dense(10, activation="elu"),
+        layers.Dense(1),
+    ], name="steering_model")
 
-    model.compile(optimizer=Adam(learning_rate=1e-4), loss="mse", metrics=["mae"])
+    optimizer = Adam(learning_rate=0.0001)
+    model.compile(optimizer=optimizer, loss="mse", metrics=["mae"])
     return model
 
 
@@ -463,7 +351,7 @@ def plot_training_history(history, filename="training_history.png"):
 def parse_args():
     """Read training settings supplied through the command line."""
     parser = argparse.ArgumentParser(
-        description="Train the PDF Figure 7 steering-angle CNN."
+        description="Train the steering-angle CNN."
     )
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=64)
@@ -472,30 +360,13 @@ def parse_args():
     parser.add_argument(
         "--max-samples-per-bin",
         type=int,
-        default=200,
+        default=400,
         help="Maximum training samples retained per steering bin; 0 disables balancing.",
     )
     parser.add_argument(
         "--no-augmentation",
         action="store_true",
         help="Disable random augmentation for the training dataset.",
-    )
-    parser.add_argument(
-        "--no-speed",
-        action="store_true",
-        help=(
-            "Train the original image-only NVIDIA architecture instead of the "
-            "speed-aware variant. Writes to model_no_speed.h5 and a separate "
-            "set of training_outputs files, leaving model.h5 untouched."
-        ),
-    )
-    parser.add_argument(
-        "--no-side-cameras",
-        action="store_true",
-        help=(
-            "Only train on the center camera; disables the left/right camera "
-            "steering-correction augmentation."
-        ),
     )
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
@@ -516,14 +387,9 @@ def main():
     configure_gpu()
     tf.random.set_seed(args.seed)
 
-    use_speed = not args.no_speed
-    use_side_cameras = not args.no_side_cameras
-    model_path = MODEL_PATH if use_speed else PROJECT_DIR / "model_no_speed.h5"
-    suffix = "" if use_speed else "_no_speed"
-
+    # Keep consecutive rows together to prevent near-identical neighboring
+    # frames from leaking into validation.
     rows = load_driving_rows()
-    # Split by contiguous chunks (not individual frames) so near-duplicate
-    # consecutive frames can't leak across the train/validation split.
     train_rows, validation_rows = split_rows_by_chunk(
         rows,
         validation_split=args.validation_split,
@@ -531,13 +397,8 @@ def main():
         seed=args.seed,
     )
 
-    # Left/right camera augmentation only applies to training; validation
-    # stays center-camera only so it reflects what the model actually sees
-    # when driving (TestSimulation.py only ever sends the center camera).
-    train_samples_before_balancing = expand_camera_samples(train_rows, use_side_cameras)
-    validation_samples = expand_camera_samples(validation_rows, use_side_cameras=False)
-
-    # Balance the training samples
+    train_samples_before_balancing = list(train_rows)
+    validation_samples = list(validation_rows)
     train_samples = balance_training_samples(
         train_samples_before_balancing,
         bins=args.steering_bins,
@@ -547,23 +408,20 @@ def main():
     if not train_samples:
         raise ValueError("Dataset balancing removed all training samples")
 
-    # Create a histogram of the steering angles before and after balancing
-    # for 4. Reviewing and Balancing the Dataset
     histogram_path = plot_steering_histogram(
         train_samples_before_balancing,
         train_samples,
         bins=args.steering_bins,
-        filename=f"steering_histogram{suffix}.png",
+        filename="steering_histogram.png",
     )
 
-    # Create training and validation sequences for Keras model.fit()
+    # DATA GENERATORS
     training_sequence = DrivingSequence(
         train_samples,
         batch_size=args.batch_size,
         augment=not args.no_augmentation,
         shuffle=True,
         seed=args.seed,
-        use_speed=use_speed,
     )
     validation_sequence = DrivingSequence(
         validation_samples,
@@ -571,43 +429,37 @@ def main():
         augment=False,
         shuffle=False,
         seed=args.seed,
-        use_speed=use_speed,
     )
 
-    # Print dataset and training information
     first_inputs, first_steering = training_sequence[0]
-    print(f"Loaded rows: {len(rows)} (train rows: {len(train_rows)}, validation rows: {len(validation_rows)})")
     print(
-        "Training camera samples before balancing: "
+        f"Loaded rows: {len(rows)} "
+        f"(train rows: {len(train_rows)}, validation rows: {len(validation_rows)})"
+    )
+    print(
+        "Training center-camera samples before balancing: "
         f"{len(train_samples_before_balancing)}"
     )
     print(f"Training samples after balancing: {len(train_samples)}")
     print(f"Validation samples (center camera only): {len(validation_samples)}")
     print(f"Training augmentation: {not args.no_augmentation}")
-    print(f"Using speed input: {use_speed}")
-    print(f"Using left/right camera augmentation: {use_side_cameras}")
     print(f"Saved steering histogram: {histogram_path}")
-    if use_speed:
-        print(
-            "First batch:",
-            f"images={first_inputs['preprocessed_image'].shape} {first_inputs['preprocessed_image'].dtype}",
-            f"speed={first_inputs['speed'].shape} {first_inputs['speed'].dtype}",
-            f"steering={first_steering.shape} {first_steering.dtype}",
-        )
-    else:
-        print(
-            "First batch:",
-            f"images={first_inputs.shape} {first_inputs.dtype}",
-            f"steering={first_steering.shape} {first_steering.dtype}",
-        )
+    print(
+        "First batch:",
+        f"images={first_inputs.shape} {first_inputs.dtype}",
+        f"steering={first_steering.shape} {first_steering.dtype}",
+    )
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    model = build_nvidia_model_with_speed() if use_speed else build_nvidia_model_image_only()
+
+    # MODEL
+    model = build_steering_model()
     model.summary()
 
+    # TRAIN
     callbacks = [
         ModelCheckpoint(
-            model_path,
+            MODEL_PATH,
             monitor="val_loss",
             save_best_only=True,
             verbose=1,
@@ -622,10 +474,10 @@ def main():
             monitor="val_loss",
             factor=0.5,
             patience=2,
-            min_lr=1e-6,
+            min_lr=0.000001,
             verbose=1,
         ),
-        CSVLogger(OUTPUT_DIR / f"training_log{suffix}.csv"),
+        CSVLogger(OUTPUT_DIR / "training_log.csv"),
     ]
 
     history = model.fit(
@@ -636,8 +488,9 @@ def main():
         verbose=2,
     )
 
-    model.save(model_path)
-    history_path = plot_training_history(history, filename=f"training_history{suffix}.png")
+    # EVALUATE
+    model.save(MODEL_PATH)
+    history_path = plot_training_history(history)
     validation_loss, validation_mae = model.evaluate(
         validation_sequence,
         verbose=0,
@@ -645,7 +498,7 @@ def main():
 
     print(f"Validation MSE: {validation_loss:.6f}")
     print(f"Validation MAE: {validation_mae:.6f}")
-    print(f"Saved model: {model_path}")
+    print(f"Saved model: {MODEL_PATH}")
     print(f"Saved history plot: {history_path}")
 
 

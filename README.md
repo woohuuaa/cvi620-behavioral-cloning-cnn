@@ -11,7 +11,8 @@ end-to-end CNN architecture required by the CVI620 final project specification.
 
 - Center-camera image and steering-angle dataset loading
 - Steering-distribution visualization and balancing
-- Random pan, zoom, rotation, brightness, and horizontal-flip augmentation
+- Mild random brightness and zoom augmentation
+- Contiguous-chunk train/validation splitting to reduce frame leakage
 - Crop, YUV conversion, Gaussian blur, resize, and normalization
 - Memory-efficient Keras batch generator
 - NVIDIA CNN with validation, checkpointing, learning-rate reduction, and early stopping
@@ -66,8 +67,8 @@ CUDA/cuDNN GPU stack for Apple's Metal backend:
 - Python 3.9
 - TensorFlow 2.10.0 (`tensorflow-macos` + `tensorflow-metal`)
 - All other pinned package versions match `environment-windows-gpu.yml`, except
-  `numpy` (1.23.5 instead of 1.22.4 — required by the `tensorflow-macos` 2.10.0
-  wheel's compiled NumPy ABI)
+  `numpy` (1.23.5 instead of 1.22.4, as required by the
+  `tensorflow-macos` 2.10.0 wheel's compiled NumPy ABI)
 
 Install [Miniforge](https://github.com/conda-forge/miniforge) if you don't
 already have Conda:
@@ -106,7 +107,24 @@ The CSV columns are:
 center, left, right, steering, throttle, brake, speed
 ```
 
-The center-camera path, steering value, and speed are used by this project.
+Only the center-camera path and steering value are used for training. The
+left-camera, right-camera, throttle, brake, and speed columns remain in the
+simulator-generated CSV but are not used by the model.
+
+## Dataset Splitting and Balancing
+
+Consecutive simulator frames are highly similar because they are recorded at
+short time intervals. Splitting individual frames randomly could place nearly
+identical images in both the training and validation sets, making validation
+results overly optimistic.
+
+To reduce this leakage, the pipeline groups every 50 consecutive rows into a
+chunk and assigns each complete chunk to either training or validation. By
+default, approximately 80% of the chunks are used for training and 20% for
+validation.
+
+Steering-bin balancing is applied only to the training set. Validation data is
+kept unchanged and contains only the original center-camera samples.
 
 ## Preprocessing
 
@@ -121,13 +139,13 @@ Training preprocessing intentionally matches `TestSimulation.py`:
 ## Model Architecture
 
 ```text
-Input: 66x200x3                    Input: speed (1, normalized by MAX_SPEED=30)
-Conv2D: 24 filters, 5x5, stride 2              |
-Conv2D: 36 filters, 5x5, stride 2              |
-Conv2D: 48 filters, 5x5, stride 2              |
-Conv2D: 64 filters, 3x3                        |
-Conv2D: 64 filters, 3x3                        |
-Flatten ------------------------- Concatenate--/
+Input: 66x200x3
+Conv2D: 24 filters, 5x5, stride 2
+Conv2D: 36 filters, 5x5, stride 2
+Conv2D: 48 filters, 5x5, stride 2
+Conv2D: 64 filters, 3x3
+Conv2D: 64 filters, 3x3
+Flatten
 Dense: 1164
 Dense: 100
 Dense: 50
@@ -135,16 +153,22 @@ Dense: 10
 Output: 1 steering value
 ```
 
-This extends the required NVIDIA end-to-end CNN (PDF Figure 7) with a second
-input: the vehicle's current speed, concatenated onto the flattened image
-features. The convolutional stack itself is unchanged. This lets the model
-apply a different steering angle for the same visual curve depending on
-speed, since the same steering angle produces a different turn radius at
-different speeds. `TestSimulation.py` must normalize speed by the same
-`MAX_SPEED` divisor used in `training.py`.
+The model follows the image-only NVIDIA end-to-end CNN architecture required
+by the project specification. It uses ELU activations, the Adam optimizer with
+an initial learning rate of `0.0001`, mean squared error loss, and mean absolute
+error as an additional metric.
 
-The model uses ELU activations, Adam, mean squared error loss, and mean
-absolute error as an additional metric.
+## Augmentation
+
+Augmentation is applied only to training samples. Each sample has a 70% chance
+of remaining unchanged. Otherwise, exactly one mild transformation is selected:
+
+- 15% overall chance of brightness adjustment in the range `0.8` to `1.2`
+- 15% overall chance of center-based zoom in the range `1.0` to `1.08`
+
+These transformations do not change the steering label. Pan, rotation, and
+horizontal flipping are intentionally not used because they produced less
+representative samples for the mostly smooth, one-direction track.
 
 ## Training
 
@@ -177,7 +201,7 @@ epochs                  20
 batch size              64
 validation split        0.20
 steering bins           31
-max samples per bin     200
+max samples per bin     400
 augmentation            enabled
 random seed             42
 ```
@@ -245,6 +269,8 @@ followed by live throttle, steering, and speed values.
 ## Notes
 
 - Training augmentation is never applied to validation data.
+- Dataset balancing is never applied to validation data.
+- Consecutive rows are split in chunks of 50 to reduce leakage between training and validation.
 - The validation split is used only for evaluation and does not update model weights.
 - `EarlyStopping` restores the best validation weights.
 - `model.h5`, the simulator, and the recorded dataset are excluded from Git.
