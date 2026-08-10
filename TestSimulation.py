@@ -52,5 +52,6 @@ def sendControl(steering, throttle):
 
 if __name__ == "__main__":
     model = load_model('model.h5')
+    # model = load_model('model_side_camera.h5')
     app = socketio.Middleware(sio, app)
     eventlet.wsgi.server(eventlet.listen(('', 4567)), app)

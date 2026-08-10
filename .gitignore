@@ -16,6 +16,7 @@ ENV/
 *.egg-info/
 build/
 dist/
+reference/
 
 # Simulator dataset and application
 IMG*/
