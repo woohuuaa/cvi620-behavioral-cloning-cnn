@@ -1,7 +1,15 @@
-"""Train the steering-angle CNN for the driving simulator.
+"""Train the steering-angle CNN for the driving simulator, using left/right
+camera images as synthetic recovery examples in addition to the center camera.
+
+This is a controlled variant of training.py with exactly one change: side
+cameras are added to the *training* split (validation stays center-camera
+only, so validation loss remains comparable to training.py's). Everything
+else — chunk-based splitting, steering-bin balancing, augmentation, model
+architecture, callbacks — is identical, so any difference in behavior can be
+attributed to the side cameras.
 
 Run:
-    python training.py --epochs 20 --batch-size 64
+    python training_with_side_camera.py --epochs 20 --batch-size 64
 """
 
 import argparse
@@ -32,13 +40,21 @@ from matplotlib import pyplot as plt
 PROJECT_DIR = Path(__file__).resolve().parent
 DRIVING_LOG_PATH = PROJECT_DIR / "driving_log.csv"
 IMAGE_DIR = PROJECT_DIR / "IMG"
-MODEL_PATH = PROJECT_DIR / "model.h5"
-OUTPUT_DIR = PROJECT_DIR / "training_outputs"
+# Written under different names from training.py's outputs so both models and
+# their plots can be compared side by side without overwriting each other.
+MODEL_PATH = PROJECT_DIR / "model_side_camera.h5"
+OUTPUT_DIR = PROJECT_DIR / "training_outputs_side_camera"
 
 # AUGMENTATION SETTINGS
 AUGMENTATION_PROBABILITY = 0.30
 BRIGHTNESS_RANGE = (0.8, 1.2)
 ZOOM_RANGE = (1.0, 1.08)
+
+# Steering offset applied to left/right camera images so they can be trained
+# as synthetic recovery examples (a left-camera shot looks like the car is
+# already right of center, so the "correct" steering is more toward the left,
+# and symmetrically for the right camera).
+STEERING_CORRECTION = 0.2
 
 # Number of consecutive rows kept together on one side of the train/validation
 # split. Splitting individual frames would let near-duplicate consecutive
@@ -115,10 +131,11 @@ def load_driving_rows(
     csv_path=DRIVING_LOG_PATH,
     image_dir=IMAGE_DIR,
 ):
-    """Load center-camera paths and steering values from driving_log.csv.
+    """Load center/left/right camera paths and steering values from driving_log.csv.
 
     Returns one entry per recorded instant, in original CSV row order, so
-    callers can split train/validation by contiguous chunks.
+    callers can split train/validation by contiguous chunks before expanding
+    each row into per-camera training samples.
     """
     rows = []
 
@@ -130,11 +147,14 @@ def load_driving_rows(
                     f"Row {row_number} has {len(row)} columns; expected at least 4"
                 )
 
-            center_path = image_dir / Path(row[0].strip()).name
-            if not center_path.is_file():
-                raise FileNotFoundError(
-                    f"Center image from row {row_number} was not found: {center_path}"
-                )
+            camera_paths = []
+            for column_index, camera_name in ((0, "Center"), (1, "Left"), (2, "Right")):
+                camera_path = image_dir / Path(row[column_index].strip()).name
+                if not camera_path.is_file():
+                    raise FileNotFoundError(
+                        f"{camera_name} image from row {row_number} was not found: {camera_path}"
+                    )
+                camera_paths.append(camera_path)
 
             try:
                 steering = float(row[3].strip())
@@ -143,12 +163,32 @@ def load_driving_rows(
                     f"Invalid steering value on row {row_number}: {row[3]!r}"
                 ) from error
 
-            rows.append((center_path, steering))
+            center_path, left_path, right_path = camera_paths
+            rows.append((center_path, left_path, right_path, steering))
 
     if not rows:
         raise ValueError(f"No driving rows found in {csv_path}")
 
     return rows
+
+
+def expand_camera_samples(rows, correction=STEERING_CORRECTION):
+    """Flatten center/left/right rows into (path, steering) training samples.
+
+    Left/right images are included as synthetic recovery examples: a
+    left-camera shot looks like the car has already drifted right of center,
+    so it's labeled with more left steering (and symmetrically for the right
+    camera).
+    """
+    samples = []
+    for center_path, left_path, right_path, steering in rows:
+        samples.append((center_path, steering))
+        left_steering = float(np.clip(steering + correction, -1.0, 1.0))
+        right_steering = float(np.clip(steering - correction, -1.0, 1.0))
+        samples.append((left_path, left_steering))
+        samples.append((right_path, right_steering))
+
+    return samples
 
 
 def split_rows_by_chunk(rows, validation_split, chunk_size, seed):
@@ -351,7 +391,7 @@ def plot_training_history(history, filename="training_history.png"):
 def parse_args():
     """Read training settings supplied through the command line."""
     parser = argparse.ArgumentParser(
-        description="Train the steering-angle CNN."
+        description="Train the steering-angle CNN with left/right camera recovery samples."
     )
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=64)
@@ -362,6 +402,12 @@ def parse_args():
         type=int,
         default=400,
         help="Maximum training samples retained per steering bin; 0 disables balancing.",
+    )
+    parser.add_argument(
+        "--steering-correction",
+        type=float,
+        default=STEERING_CORRECTION,
+        help="Steering offset applied to left/right camera samples.",
     )
     parser.add_argument(
         "--no-augmentation",
@@ -383,8 +429,6 @@ def main():
     if not 0.0 < args.validation_split < 1.0:
         raise ValueError("--validation-split must be between 0 and 1")
 
-    # Set random seeds for reproducibility and configure GPU memory growth
-    # Setting the seed for NumPy and TensorFlow ensures that the random operations produce the same results across runs, which is important for debugging and comparing model performance.
     np.random.seed(args.seed)
     configure_gpu()
     tf.random.set_seed(args.seed)
@@ -399,8 +443,16 @@ def main():
         seed=args.seed,
     )
 
-    train_samples_before_balancing = list(train_rows)
-    validation_samples = list(validation_rows)
+    # Side cameras are added only to the training split as synthetic
+    # recovery examples. Validation stays center-camera only so its loss
+    # remains directly comparable to training.py's.
+    train_samples_before_balancing = expand_camera_samples(
+        train_rows,
+        correction=args.steering_correction,
+    )
+    validation_samples = [
+        (center_path, steering) for center_path, _, _, steering in validation_rows
+    ]
     train_samples = balance_training_samples(
         train_samples_before_balancing,
         bins=args.steering_bins,
@@ -438,8 +490,9 @@ def main():
         f"Loaded rows: {len(rows)} "
         f"(train rows: {len(train_rows)}, validation rows: {len(validation_rows)})"
     )
+    print(f"Steering correction for side cameras: {args.steering_correction}")
     print(
-        "Training center-camera samples before balancing: "
+        "Training samples before balancing (center+left+right): "
         f"{len(train_samples_before_balancing)}"
     )
     print(f"Training samples after balancing: {len(train_samples)}")
